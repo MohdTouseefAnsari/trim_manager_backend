@@ -24,10 +24,10 @@ class Listings(Base):
     __tablename__ = "listings"
 
     ad_id = Column(String, primary_key=True, index=True)
-    make = Column(String)
+    brand = Column(String)
     model = Column(String)
     year = Column(Integer)
-    raw_trim = Column(String)
+    trim = Column(String)
     normalized_trim = Column(String)
     trim_confidence = Column(Float)
     assignment_method = Column(String)

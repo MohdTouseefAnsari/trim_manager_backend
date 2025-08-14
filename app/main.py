@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from app import models
 from app.database import engine
-from app.routes import aliases,trims
+from app.routes import aliases,trims,listings
 from fastapi.middleware.cors import CORSMiddleware
 
 origins = [
@@ -25,3 +25,4 @@ app.add_middleware(
 
 app.include_router(aliases.router, tags=["Aliases"])
 app.include_router(trims.router, tags=["Trims"])
+app.include_router(listings.router, tags = ["Listings"])
