@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from typing import Optional, List
 from datetime import datetime
-
+from sqlalchemy import text
 from app.database import SessionLocal
 from app import models, db_utils, matching
 
@@ -19,6 +19,52 @@ def get_db():
     finally:
         db.close()
 
+
+# app/routes/listings.py
+WEBSITE_TABLE_MAP = {
+    "dubizzle": "dubizzle_details",
+    "carswitch": "carswitch_details",
+    "syarah": "syarah_details",
+    "opensooq": "opensooq_details",
+}
+
+@router.get("/listings/{ad_id}/details")
+def get_full_listing(ad_id: str, db: Session = Depends(get_db)):
+    # 1. Fetch the listing
+    listing = db.query(models.Listings).filter(models.Listings.ad_id == ad_id).first()
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    website = listing.website.lower()
+    if website not in WEBSITE_TABLE_MAP:
+        raise HTTPException(status_code=400, detail=f"No details table for website {website}")
+
+    details_table = WEBSITE_TABLE_MAP[website]
+
+    # 2. Fetch website-specific details
+    details = db.execute(
+    text(f"SELECT * FROM {details_table} WHERE ad_id = :lid"),
+    {"lid": ad_id}).mappings().first()
+
+    # 3. Combine base listing + details for frontend
+    listing_data = {
+        "ad_id": listing.ad_id,
+        "brand": listing.brand,
+        "model": listing.model,
+        "year": listing.year,
+        "trim": listing.trim,
+        "normalized_trim": listing.normalized_trim,
+        "confidence": listing.trim_confidence,
+        "method": listing.assignment_method,
+        "needs_review": listing.needs_review,
+        "processed_at": listing.processed_at,
+        "last_reviewed_at": listing.last_reviewed_at,
+    }
+
+    return {
+        "listing": listing_data,
+        "details": dict(details) if details else {}
+    }
 
 # ----------------------
 # Process unprocessed listings
@@ -36,8 +82,9 @@ def process_listings(limit: int = 500, db: Session = Depends(get_db)):
         ad_id, brand, model, year, trim = listing
         candidate_trims = matching.get_candidate_trims(db, brand, model)
 
+        # temporary object for matching
         listing_obj = type("Obj", (object,), {
-            "raw_trim": trim,
+            "trim": trim,  # provide .trim to matching.match_trim
             "brand": brand,
             "model": model
         })
@@ -117,14 +164,14 @@ def get_processed_listings(
         q = q.filter(models.Listings.assignment_method == method)
     q = q.filter(models.Listings.trim_confidence >= min_conf, models.Listings.trim_confidence <= max_conf)
 
-    rows = q.limit(limit).all()
+    rows = q.all()
     return [
         {
             "ad_id": r.ad_id,
             "brand": r.brand,
             "model": r.model,
             "year": r.year,
-            "raw_trim": r.trim,
+            "trim": r.trim,  # consistent key for frontend
             "normalized_trim": r.normalized_trim,
             "confidence": r.trim_confidence,
             "method": r.assignment_method,
@@ -135,8 +182,12 @@ def get_processed_listings(
     ]
 
 
+
+
+
+
 # ----------------------
-# Manually assign trim (with optional alias)
+# Manually assign trim
 # ----------------------
 @router.post("/listings/{ad_id}/assign-trim")
 def assign_trim_manual(
@@ -150,8 +201,6 @@ def assign_trim_manual(
     - normalized_trim
     - confidence
     - changed_by
-    - create_alias
-    - alias_text
     """
     listing = db.query(models.Listings).filter(models.Listings.ad_id == ad_id).first()
     if not listing:
@@ -188,17 +237,6 @@ def assign_trim_manual(
     )
     db.add(history)
 
-    # Optional alias creation
-    if payload.get("create_alias") and payload.get("alias_text") and trim_master_id:
-        alias_text = payload["alias_text"].strip().lower()
-        existing = db.query(models.TrimAlias).filter(
-            models.TrimAlias.trim_master_id == trim_master_id,
-            models.TrimAlias.alias == alias_text
-        ).first()
-        if not existing:
-            new_alias = models.TrimAlias(trim_master_id=trim_master_id, alias=alias_text)
-            db.add(new_alias)
-
     db.commit()
     return {"status": "ok", "ad_id": ad_id, "normalized_trim": normalized_trim}
 
@@ -214,7 +252,7 @@ def reprocess_listing(ad_id: str, db: Session = Depends(get_db)):
 
     candidate_trims = matching.get_candidate_trims(db, listing.brand, listing.model)
     listing_obj = type("Obj", (object,), {
-        "raw_trim": listing.trim,
+        "trim": listing.trim,  # changed from raw_trim
         "brand": listing.brand,
         "model": listing.model
     })

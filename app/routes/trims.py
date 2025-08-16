@@ -3,7 +3,6 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from app.database import SessionLocal
 from app import models, schemas
-
 router = APIRouter()
 
 # Dependency
@@ -23,6 +22,8 @@ def list_trims(
     limit: int = 50,
     db: Session = Depends(get_db)
 ):
+
+
     query = db.query(models.TrimMaster)
 
     if make:
@@ -30,7 +31,8 @@ def list_trims(
     if model:
         query = query.filter(models.TrimMaster.model.ilike(model))
 
-    trims = query.offset(skip).limit(limit).all()
+    #trims = query.offset(skip).limit(limit).all()
+    trims = query.all()
     return trims
 
 # ----- POST /trims -----
@@ -57,3 +59,4 @@ def add_trim(trim_in: schemas.TrimCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(trim)
     return trim
+

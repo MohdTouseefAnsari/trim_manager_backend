@@ -4,6 +4,8 @@ from rapidfuzz import process, fuzz
 from typing import Optional, Dict
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from .llm_classification import llm_assign
+import json
 
 def match_trim(listing, candidate_trims):
     """
@@ -27,6 +29,13 @@ def match_trim(listing, candidate_trims):
             "assignment_method": "exact"
         }
 
+    #then try using groq call or any AI calls:
+    ai_guess = llm_assign(listing, candidate_trims)
+    if ai_guess.get("trim"):
+        return ai_guess
+    else:
+        print("No match found")
+
     # Fuzzy match
     match_tuple = process.extractOne(trim, candidate_trims, scorer=fuzz.ratio)
     if match_tuple:  # Only unpack if match_tuple is not None
@@ -36,6 +45,8 @@ def match_trim(listing, candidate_trims):
             "confidence": score / 100.0,
             "assignment_method": "fuzzy"
         }
+
+
 
     # No match
     return {

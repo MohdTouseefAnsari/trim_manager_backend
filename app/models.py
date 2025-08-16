@@ -28,6 +28,7 @@ class Listings(Base):
     model = Column(String)
     year = Column(Integer)
     trim = Column(String)
+    website = Column(String)
     normalized_trim = Column(String)
     trim_confidence = Column(Float)
     assignment_method = Column(String)
