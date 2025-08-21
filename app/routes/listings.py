@@ -3,9 +3,15 @@ from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from typing import Optional, List
 from datetime import datetime
-from sqlalchemy import text
+from sqlalchemy import text, func, case
 from app.database import SessionLocal
 from app import models, db_utils, matching
+from collections import Counter
+
+
+import asyncio
+import httpx
+
 
 router = APIRouter()
 
@@ -66,59 +72,176 @@ def get_full_listing(ad_id: str, db: Session = Depends(get_db)):
         "details": dict(details) if details else {}
     }
 
-# ----------------------
-# Process unprocessed listings
-# ----------------------
+
 @router.post("/process-listings")
-def process_listings(limit: int = 500, db: Session = Depends(get_db)):
+def process_listings(
+    db: Session = Depends(get_db),
+    limit: int = Query(None, ge=1),
+    batch_size: int = Query(100, ge=10)
+):
+    """
+    Process unprocessed listings in batches.
+    Limit: maximum number of unprocessed listings to process
+    Batch_size: how many to commit at a time
+    """
     unprocessed = db_utils.get_unprocessed_listings(db, limit)
 
+    if not unprocessed:
+        return {"status": "ok", "message": "No unprocessed listings found"}
+
+    stats_methods = Counter()
+    stats_confidence = Counter()
     processed_count = 0
-    exact_matches = 0
-    fuzzy_matches = 0
-    unmatched = 0
 
     for listing in unprocessed:
-        ad_id, brand, model, year, trim = listing
+        ad_id, brand, model, year, trim, title, website = listing
         candidate_trims = matching.get_candidate_trims(db, brand, model)
+
+        website = website.lower()
+        details_table = WEBSITE_TABLE_MAP[website]
+
+        #
+        details = db.execute(
+            text(f"SELECT * FROM {details_table} WHERE ad_id = :lid"),
+            {"lid": ad_id}
+        ).mappings().first()
+
+        description = details["description"] if details and "description" in details else None
 
         # temporary object for matching
         listing_obj = type("Obj", (object,), {
-            "trim": trim,  # provide .trim to matching.match_trim
+            "title": title,
+            "trim": trim,
             "brand": brand,
-            "model": model
+            "model": model,
+            "description": description
         })
 
         match_result = matching.match_trim(
             listing=listing_obj,
-            candidate_trims=candidate_trims
+            candidate_trims=candidate_trims,
+            allow_external_llm=True,
+            fuzzy_primary_threshold=82,
+            fuzzy_secondary_threshold=74,
+            min_ai_confidence=0.55,
         )
 
         method = match_result.get("assignment_method", "unmatched")
-        if method == "exact":
-            exact_matches += 1
-        elif method == "fuzzy":
-            fuzzy_matches += 1
+        stats_methods[method] += 1
+
+        conf = match_result.get("confidence", 0.0)
+        if conf >= 0.75:
+            stats_confidence["high"] += 1
+        elif conf >= 0.4:
+            stats_confidence["medium"] += 1
         else:
-            unmatched += 1
+            stats_confidence["low"] += 1
 
         # update listing & record history
         db_utils.update_listing_with_match(
             db=db,
             ad_id=ad_id,
             normalized_trim=match_result.get("trim"),
-            confidence=match_result.get("confidence", 0.0),
+            confidence=conf,
             method=method
         )
 
         processed_count += 1
 
+        # Commit every batch_size
+        if processed_count % batch_size == 0:
+            db.commit()
+
+    # Final commit
+    db.commit()
+
     return {
+        "status": "ok",
         "processed": processed_count,
-        "exact_matches": exact_matches,
-        "fuzzy_matches": fuzzy_matches,
-        "unmatched": unmatched
+        "methods": dict(stats_methods),
+        "confidence": dict(stats_confidence)
     }
+# # ----------------------
+# # Process unprocessed listings
+# # ----------------------
+# @router.post("/process-listings")
+# def process_listings(limit: int = 5, db: Session = Depends(get_db)):
+#     unprocessed = db_utils.get_unprocessed_listings(db, limit)
+
+#     processed_count = 0
+#     exact_matches = 0
+#     fuzzy_matches = 0
+#     llm_matches = 0
+#     unmatched = 0
+
+#     for listing in unprocessed:
+#         ad_id, brand, model, year, trim, title, website = listing
+#         candidate_trims = matching.get_candidate_trims(db, brand, model)
+
+#         website = website.lower()
+#         details_table = WEBSITE_TABLE_MAP[website]
+
+#     # 2. Fetch website-specific details
+#         details = db.execute(
+#         text(f"SELECT * FROM {details_table} WHERE ad_id = :lid"),
+#         {"lid": ad_id}).mappings().first()
+
+#         description = None
+#         if details and "description" in details:
+#             description = details['description']
+#             print("Description:", details["description"])
+#         else:
+#             print("No description column or no result")
+
+
+#         # temporary object for matching
+#         listing_obj = type("Obj", (object,), {
+#             "title": title,
+#             "trim": trim,  # provide .trim to matching.match_trim
+#             "brand": brand,
+#             "model": model,
+#             "description": description
+#         })
+
+
+
+#         match_result = matching.match_trim(
+#     listing=listing_obj,
+#     candidate_trims=candidate_trims,
+#     allow_external_llm=True,          # or False to run cheaper/faster passes
+#     fuzzy_primary_threshold=82,
+#     fuzzy_secondary_threshold=74,
+#     min_ai_confidence=0.55,
+# )
+
+#         method = match_result.get("assignment_method", "unmatched")
+#         if method == "exact":
+#             exact_matches += 1
+#         elif method == "fuzzy":
+#             fuzzy_matches += 1
+#         elif method == "LLM":
+#             llm_matches += 1
+#         else:
+#             unmatched += 1
+
+#         # update listing & record history
+#         db_utils.update_listing_with_match(
+#             db=db,
+#             ad_id=ad_id,
+#             normalized_trim=match_result.get("trim"),
+#             confidence=match_result.get("confidence", 0.0),
+#             method=method
+#         )
+
+#         processed_count += 1
+
+#     return {
+#         "processed": processed_count,
+#         "exact_matches": exact_matches,
+#         "fuzzy_matches": fuzzy_matches,
+#         "llm_matches": llm_matches,
+#         "unmatched": unmatched
+#     }
 
 
 # ----------------------
@@ -325,3 +448,321 @@ def get_stats(db: Session = Depends(get_db)):
     processed = db.query(models.Listings).filter(models.Listings.processed_at.isnot(None)).count()
     needs_review = db.query(models.Listings).filter(models.Listings.needs_review.is_(True)).count()
     return {"total": total, "processed": processed, "needs_review": needs_review}
+
+
+
+
+
+# ----------------------
+# Detailed stats endpoint
+# ----------------------
+
+@router.get("/stats/detailed")
+def get_detailed_stats(db: Session = Depends(get_db)):
+    total = db.query(models.Listings).count()
+    processed = db.query(models.Listings).filter(models.Listings.processed_at.isnot(None)).count()
+    needs_review = db.query(models.Listings).filter(models.Listings.needs_review.is_(True)).count()
+
+    # Count by assignment_method
+    method_counts = (
+        db.query(
+            models.Listings.assignment_method,
+            func.count().label("count")
+        )
+        .group_by(models.Listings.assignment_method)
+        .all()
+    )
+
+    # Confidence distribution (low/med/high)
+    conf_buckets = (
+        db.query(
+            func.count(case((models.Listings.trim_confidence < 0.5, 1))).label("low_conf"),
+            func.count(case(((models.Listings.trim_confidence >= 0.5) & (models.Listings.trim_confidence < 0.8), 1))).label("medium_conf"),
+            func.count(case((models.Listings.trim_confidence >= 0.8, 1))).label("high_conf"),
+        )
+        .first()
+    )
+
+    # Average confidence overall
+    avg_conf = db.query(func.avg(models.Listings.trim_confidence)).scalar()
+
+    # Breakdown by brand (top 10)
+    brand_breakdown = (
+        db.query(
+            models.Listings.brand,
+            func.count().label("count"),
+            func.avg(models.Listings.trim_confidence).label("avg_conf"),
+        )
+        .group_by(models.Listings.brand)
+        .order_by(func.count().desc())
+        .limit(10)
+        .all()
+    )
+
+    return {
+        "summary": {
+            "total": total,
+            "processed": processed,
+            "needs_review": needs_review,
+            "avg_confidence": round(avg_conf or 0, 3),
+        },
+        "methods": {m: c for m, c in method_counts},
+        "confidence": {
+            "low": conf_buckets.low_conf,
+            "medium": conf_buckets.medium_conf,
+            "high": conf_buckets.high_conf,
+        },
+        "brands_top10": [
+            {"brand": b, "count": c, "avg_conf": round(ac or 0, 3)}
+            for b, c, ac in brand_breakdown
+        ]
+    }
+
+
+# async def process_listing(listing, db: Session):
+#     """Process a single listing using existing matching logic."""
+#     candidate_trims = matching.get_candidate_trims(db, listing.brand, listing.model)
+#     listing_obj = type("Obj", (object,), {
+#         "trim": listing.trim,
+#         "brand": listing.brand,
+#         "model": listing.model,
+#         "title": getattr(listing, "title", ""),
+#         "description": getattr(listing, "description", "")
+#     })
+#     # Use existing match_trim (sync), can still call async LLM internally if needed
+#     match_result = matching.match_trim(listing_obj, candidate_trims)
+
+#     old_trim = listing.normalized_trim
+
+#     listing.normalized_trim = match_result.get("trim")
+#     listing.trim_confidence = match_result.get("confidence", 0.0)
+#     listing.assignment_method = match_result.get("assignment_method", "unmatched")
+#     listing.needs_review = (listing.assignment_method == "unmatched")
+#     listing.processed_at = datetime.utcnow()
+
+#     history = models.TrimHistory(
+#         listing_id=listing.ad_id,
+#         old_trim=old_trim,
+#         new_trim=match_result.get("trim"),
+#         changed_by="system_bulk_reprocess_async",
+#         changed_at=datetime.utcnow()
+#     )
+#     db.add(history)
+
+#     return match_result
+
+# async def process_batch(batch, db: Session):
+#     """Process a batch of listings concurrently."""
+#     tasks = [asyncio.to_thread(process_listing, listing, db) for listing in batch]
+#     results = await asyncio.gather(*tasks)
+#     db.commit()  # commit once per batch
+#     return results
+
+# @router.post("/reprocess-processed-async")
+# async def reprocess_processed_async(
+#     db: Session = Depends(get_db),
+#     limit: int = Query(None, ge=1),
+#     batch_size: int = Query(50, ge=10)  # smaller batch_size for async safety
+# ):
+#     query = db.query(models.Listings).filter(models.Listings.processed_at.isnot(None))
+#     if limit:
+#         query = query.limit(limit)
+#     listings = query.all()
+#     if not listings:
+#         return {"status": "ok", "message": "No processed listings found"}
+
+#     stats_methods = Counter()
+#     stats_confidence = Counter()
+#     processed_count = 0
+
+#     # Split listings into batches
+#     for i in range(0, len(listings), batch_size):
+#         batch = listings[i:i+batch_size]
+#         results = await process_batch(batch, db)
+#         # Update stats
+#         for res, listing in zip(results, batch):
+#             stats_methods[listing.assignment_method] += 1
+#             conf = listing.trim_confidence
+#             if conf >= 0.75:
+#                 stats_confidence["high"] += 1
+#             elif conf >= 0.4:
+#                 stats_confidence["medium"] += 1
+#             else:
+#                 stats_confidence["low"] += 1
+#             processed_count += 1
+
+#     return {
+#         "status": "ok",
+#         "processed": processed_count,
+#         "methods": dict(stats_methods),
+#         "confidence": dict(stats_confidence)
+#     }
+
+@router.post("/reprocess-processed")
+def reprocess_processed(
+    db: Session = Depends(get_db),
+    brand: str = Query(None),
+    model: str = Query(None),
+    limit: int = Query(None, ge=1),
+    batch_size: int = Query(100, ge=10)
+):
+    """
+    Reprocess already processed listings with updated matching logic.
+    Optional filters: brand, model
+    Limit: maximum number of listings to reprocess
+    Batch_size: how many to commit at a time
+    """
+    query = db.query(models.Listings).filter(models.Listings.processed_at.isnot(None))
+    if brand:
+        query = query.filter(models.Listings.brand.ilike(brand))
+    if model:
+        query = query.filter(models.Listings.model.ilike(model))
+    if limit:
+        query = query.limit(limit)
+
+    listings = query.all()
+    if not listings:
+        return {"status": "ok", "message": "No processed listings found for the given filters"}
+
+    stats_methods = Counter()
+    stats_confidence = Counter()
+    processed_count = 0
+
+    for listing in listings:
+        candidate_trims = matching.get_candidate_trims(db, listing.brand, listing.model)
+        listing_obj = type("Obj", (object,), {
+            "trim": listing.trim,
+            "brand": listing.brand,
+            "model": listing.model,
+            "title": getattr(listing, "title", ""),
+            "description": getattr(listing, "description", "")
+        })
+        match_result = match_result = matching.match_trim(
+    listing=listing_obj,
+    candidate_trims=candidate_trims,
+    allow_external_llm=True,          # or False to run cheaper/faster passes
+    fuzzy_primary_threshold=82,
+    fuzzy_secondary_threshold=74,
+    min_ai_confidence=0.55,
+)
+
+        old_trim = listing.normalized_trim
+
+        listing.normalized_trim = match_result.get("trim")
+        listing.trim_confidence = match_result.get("confidence", 0.0)
+        listing.assignment_method = match_result.get("assignment_method", "unmatched")
+        listing.needs_review = (listing.assignment_method == "unmatched")
+        listing.processed_at = datetime.utcnow()
+
+        new_trim = match_result.get("trim") or ""
+
+        history = models.TrimHistory(
+            listing_id=listing.ad_id,
+            old_trim=old_trim,
+            new_trim=new_trim,
+            changed_by="system_bulk_reprocess",
+            changed_at=datetime.utcnow()
+        )
+        db.add(history)
+
+        stats_methods[listing.assignment_method] += 1
+        conf = listing.trim_confidence
+        if conf >= 0.75:
+            stats_confidence["high"] += 1
+        elif conf >= 0.4:
+            stats_confidence["medium"] += 1
+        else:
+            stats_confidence["low"] += 1
+
+        processed_count += 1
+
+        # Commit every batch_size records
+        if processed_count % batch_size == 0:
+            db.commit()
+
+    db.commit()
+    return {
+        "status": "ok",
+        "processed": processed_count,
+        "methods": dict(stats_methods),
+        "confidence": dict(stats_confidence)
+    }
+# # ----------------------
+# # Bulk reprocess processed listings
+# # ----------------------
+# @router.post("/reprocess-processed")
+# def reprocess_processed_listings(
+#     limit: int = Query(500, ge=1, le=5000),  # batch size
+#     db: Session = Depends(get_db)
+# ):
+#     """
+#     Reprocess listings that were already processed before.
+#     Skips manual assignments.
+#     """
+#     # 1. Fetch already processed (but not manual) listings
+#     listings = (
+#         db.query(models.Listings)
+#         .filter(
+#             models.Listings.processed_at.isnot(None),
+#             models.Listings.assignment_method != "manual"
+#         )
+#         .limit(limit)
+#         .all()
+#     )
+
+#     if not listings:
+#         return {"status": "done", "message": "No eligible listings found"}
+
+#     reprocessed_count = 0
+#     method_counts = {"exact": 0, "fuzzy": 0, "LLM": 0, "unmatched": 0}
+
+#     for listing in listings:
+#         candidate_trims = matching.get_candidate_trims(db, listing.brand, listing.model)
+
+#         # Build lightweight object for matcher
+#         listing_obj = type("Obj", (object,), {
+#             "trim": listing.trim,
+#             "brand": listing.brand,
+#             "model": listing.model,
+#             "title": getattr(listing, "title", None),
+#             "description": getattr(listing, "description", None)
+#         })
+
+#         match_result = matching.match_trim(listing_obj, candidate_trims)
+
+#         # Record old trim
+#         old_trim = listing.normalized_trim
+
+#         # Update listing
+#         listing.normalized_trim = match_result.get("trim")
+#         listing.trim_confidence = match_result.get("confidence", 0.0)
+#         listing.assignment_method = match_result.get("assignment_method", "unmatched")
+#         listing.needs_review = (listing.assignment_method == "unmatched")
+#         listing.processed_at = datetime.utcnow()
+
+#         # Count methods
+#         method = listing.assignment_method
+#         if method in method_counts:
+#             method_counts[method] += 1
+#         else:
+#             method_counts["unmatched"] += 1
+
+#         # Record history
+#         history = models.TrimHistory(
+#             listing_id=listing.ad_id,
+#             old_trim=old_trim,
+#             new_trim=listing.normalized_trim,
+#             changed_by="system_bulk_reprocess",
+#             changed_at=datetime.utcnow()
+#         )
+#         db.add(history)
+
+#         reprocessed_count += 1
+
+#     db.commit()
+
+#     return {
+#         "status": "ok",
+#         "reprocessed": reprocessed_count,
+#         "method_counts": method_counts
+#     }

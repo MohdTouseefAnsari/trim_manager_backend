@@ -16,11 +16,13 @@ def get_unprocessed_listings(db: Session, limit: int = 500, offset: int = 0):
             models.Listings.brand,
             models.Listings.model,
             models.Listings.year,
-            models.Listings.trim
+            models.Listings.trim,
+            models.Listings.title,
+            models.Listings.website
         )
         .filter(
-            (models.Listings.processed_at.is_(None)) |
-            (models.Listings.needs_review.is_(True))
+            (models.Listings.processed_at.is_(None)) #|
+           # (models.Listings.needs_review.is_(True))
         )
         .offset(offset)
         .limit(limit)

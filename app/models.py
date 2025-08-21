@@ -24,9 +24,11 @@ class Listings(Base):
     __tablename__ = "listings"
 
     ad_id = Column(String, primary_key=True, index=True)
+    title = Column(String)
     brand = Column(String)
     model = Column(String)
     year = Column(Integer)
+    website = Column(String)
     trim = Column(String)
     website = Column(String)
     normalized_trim = Column(String)
