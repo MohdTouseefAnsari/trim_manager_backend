@@ -50,6 +50,8 @@ def list_aliases(
         for row in aliases
     ]
     return result
+
+
 @router.post("/aliases", response_model=schemas.Alias)
 def add_alias(alias_in: schemas.AliasCreate, db: Session = Depends(get_db)):   # ✅ FIXED
     trim = db.query(models.TrimMaster).filter(models.TrimMaster.id == alias_in.trim_master_id).first()

@@ -6,3 +6,5 @@ alembic
 python-dotenv
 rapidfuzz
 pydantic
+requests
+httpx
