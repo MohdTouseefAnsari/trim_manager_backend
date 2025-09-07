@@ -1,0 +1,136 @@
+name: Deploy Trim Manager Backend
+
+on:
+  push:
+    branches: [ dev ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      SERVICE_NAME: ${{ github.ref == 'refs/heads/main' && 'trim-manager-backend-prod' || github.ref == 'refs/heads/staging' && 'trim-manager-backend-staging' || github.ref == 'refs/heads/dev' && 'trim-manager-backend-dev' }}
+      GCP_PROJECT_ID: emflex-staging
+      CLOUD_RUN_REGION: us-central1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Decode GCP credentials
+        run: echo "${{ secrets.GCP_SERVICE_ACCOUNT }}" | base64 -d > $HOME/gcp-key.json
+
+      - name: Debug JSON
+        run: cat $HOME/gcp-key.json | jq
+
+      - name: Gcloud Manual Auth
+        run: |
+          gcloud auth activate-service-account --key-file=$HOME/gcp-key.json
+          gcloud config set project ${{ env.GCP_PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      # - name: Setup tmate session
+      #   id: ssh-to-runner
+      #   uses: mxschmitt/action-tmate@v3
+
+      - name: Build and push container
+        run: |
+          echo "Building image for ${{ env.SERVICE_NAME }}"
+          IMAGE_URI=us-central1-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/gcr-repo/${{ env.SERVICE_NAME }}
+          echo "IMAGE_URI: $IMAGE_URI"
+          docker build -t $IMAGE_URI:latest .
+
+          echo "Pushing image to Artifact Registry"
+          gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin us-central1-docker.pkg.dev
+          docker push $IMAGE_URI
+
+      - name: Write .env file from GitHub Secret
+        id: write-env-file-dev
+        if: ${{ github.ref == 'refs/heads/dev' }}
+        run: |
+          # Write secret to file using cat to avoid shell interpretation
+          cat > .env << 'EOF'
+          ${{ secrets.TRIM_MANAGER_ENV_FILE_DEV }}
+          EOF
+          echo "" > env.yaml
+          # Use Python to properly handle YAML generation
+          python3 -c "
+          import yaml
+          import os
+
+          env_vars = {}
+          with open('.env', 'r') as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith('#'):
+                      if '=' in line:
+                          key, value = line.split('=', 1)
+                          key = key.strip()
+                          value = value.strip()
+                          # Remove quotes if present
+                          if (value.startswith('\"') and value.endswith('\"')) or (value.startswith(\"'\") and value.endswith(\"'\")):
+                              value = value[1:-1]
+                          env_vars[key] = value
+
+          with open('env.yaml', 'w') as f:
+              yaml.dump(env_vars, f, default_flow_style=False, allow_unicode=True)
+
+          print('Generated env.yaml:')
+          with open('env.yaml', 'r') as f:
+              print(f.read())
+          "
+
+      - name: Write .env file from GitHub Secret
+        id: write-env-file-main
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          # Write secret to file using cat to avoid shell interpretation
+          cat > .env << 'EOF'
+          ${{ secrets.TRIM_MANAGER_ENV_FILE_PROD }}
+          EOF
+          echo "" > env.yaml
+          # Use Python to properly handle YAML generation
+          python3 -c "
+          import yaml
+          import os
+
+          env_vars = {}
+          with open('.env', 'r') as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith('#'):
+                      if '=' in line:
+                          key, value = line.split('=', 1)
+                          key = key.strip()
+                          value = value.strip()
+                          # Remove quotes if present
+                          if (value.startswith('\"') and value.endswith('\"')) or (value.startswith(\"'\") and value.endswith(\"'\")):
+                              value = value[1:-1]
+                          env_vars[key] = value
+
+          with open('env.yaml', 'w') as f:
+              yaml.dump(env_vars, f, default_flow_style=False, allow_unicode=True)
+
+          print('Generated env.yaml:')
+          with open('env.yaml', 'r') as f:
+              print(f.read())
+          "
+
+      - name: Deploy to Cloud Run
+        id: deploy-to-cloud-run
+        run: |
+          IMAGE_URI=us-central1-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/gcr-repo/${{ env.SERVICE_NAME }}
+          echo "Deploying with image: $IMAGE_URI"
+
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image "$IMAGE_URI" \
+            --platform managed \
+            --region "$CLOUD_RUN_REGION" \
+            --allow-unauthenticated \
+            --port 8000 \
+            --service-account github-actions-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com \
+            --ingress all \
+            --env-vars-file env.yaml \
+            --quiet
